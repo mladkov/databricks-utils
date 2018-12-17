@@ -1,57 +1,98 @@
 #!/usr/bin/env python3
-
-import sys
 import json
+import os
+import sys
 import time
-import numpy as np
+import zipfile
+from os import path
+
 import pandas as pd
 
-HELP = "./dbcMetrics.py <Databricks-dbc-file>"
+HELP_MESSAGE = "./dbcMetrics.py <Databricks-dbc-file>"
+DEBUG_MODE = False
+LANGUAGES = ["scala", "python", "sql", "r"]
 
-def main(args):
-    print("Extracting Metrics from DBC archive file: {}".format(args[1]))
 
-    fileName    = args[1]
-    outFileName = fileName[:fileName.rindex(".")] + ".csv"
-    print("DBC Filename     : {}".format(fileName))
-    print("Metrics Filename : {}".format(outFileName))
+def main(path_to_dbc):
+    folder_name = path.splitext(path_to_dbc)[0]
 
-    with open(fileName) as f:
-        data = json.load(f)
+    with zipfile.ZipFile(path_to_dbc, 'r') as zip_ref:
+        zip_ref.extractall(folder_name)
 
-    print("Name: {}".format(data['name']))
-    commands = data['commands']
-    metrics = list()
-    for c in commands:
-        d = DBCMetric(c['command'], c['state'], c['startTime'], c['submitTime'], c['finishTime'])
-        print("{executeSeconds: >10.2f}sec ({executeMinutes: >5.1f}min): {startTime: >20} ({submitTime: >20}) to {finishTime: >20}: {state: >10}: {command}".format(startTime = d.startTimeStr, submitTime = d.submitTimeStr, finishTime = d.finishTimeStr, executeSeconds = d.executeSeconds, executeMinutes = d.executeMinutes, state = d.state, command = d.cleanCommand[:150]))
-        metrics.append([d.command, float(d.executeMinutes)])
-    pd.set_option('display.max_colwidth', 100)
-    metricArray = np.array(metrics)
-    dt = np.dtype({'names':['command','execute_minutes'], 'formats':[np.generic, np.float]})
-    p = pd.DataFrame(metricArray,columns=['command','execute_minutes'])
-    p1 = p.astype({'execute_minutes':np.float})
-    #p = pd.DataFrame(metricArray,columns=['command','execute_minutes'],dtype=[('execute_minutes', np.float),('command', np.generic)])
-    print("Pandas: {}".format(p1.sort_values(by=['execute_minutes'], ascending=False)[['execute_minutes', 'command']]))
-    print("Sum (minutes): {}".format(p1['execute_minutes'].sum()))
+    for root, dirs, files in os.walk(folder_name):
+        sorted_files = sorted(files, key=lambda file: path.splitext(file)[0])
+        for name in sorted_files:
+            file_to_process = path.join(root, name)
+            file_to_process_extn = path.splitext(file_to_process)[1][1:]
+            if file_to_process_extn in LANGUAGES:
+                log_to_console(f"\nProcessing: {file_to_process}")
+                out_file = path.splitext(file_to_process)[0] + ".csv"
+                with open(file_to_process) as f:
+                    data = json.load(f)
 
-class DBCMetric:
-    def __init__(self, command, state, startTime, submitTime, finishTime):
+                commands = data['commands']
+                metrics = []
+                all_commands_output = []
+                for command in commands:
+                    metric = DbcMetric(command['command'],
+                                       command['state'],
+                                       command['startTime'],
+                                       command['submitTime'],
+                                       command['finishTime'])
+                    metrics.append([metric.command_trimmed, metric.exec_mins])
+                    indiv_output = f"{metric.exec_secs: >10.2f}sec ({metric.exec_mins: >5.1f}min): " \
+                        f"({metric.submit_time: >20} {metric.start_time: >20}) to {metric.finish_time: >20}: " \
+                        f"{metric.state: >10}: {metric.command_trimmed}"
+                    all_commands_output.append(indiv_output)
+                    log_to_console(indiv_output)
+                log_to_file(out_file, "w", '\n'.join(all_commands_output) + "\n\n")
+                pd.set_option('display.max_colwidth', 100)
+                pd.set_option('display.float_format', lambda x: '%.4f' % x)
+                df = pd.DataFrame(metrics, columns=['command_trimmed', 'exec_mins'])
+                df['exec_mins'] = df['exec_mins'].astype(float)
+                df = df.sort_values(by=['exec_mins'], ascending=False)[['exec_mins', 'command_trimmed']]
+                log_to_console(f"Pandas: {df}")
+                df.to_csv(out_file, mode='a', sep="\t", float_format='%.4f', header=['exec_time_mins', 'command'])
+                final_msg = f"\n\n**Total time to execute '{file_to_process}': {df['exec_mins'].sum(): >.4f} mins.**"
+                log_to_file(out_file, "a", final_msg)
+                print(final_msg)
+    return None
+
+
+class DbcMetric:
+    def __init__(self, command, state, start_time, submit_time, finish_time):
         self.command = command
         self.state = state
-        self.startTime = startTime
-        self.submitTime = submitTime
-        self.finishTime = finishTime
-        self.cleanCommand = command.replace('\n', ' ')
-        self.startTimeStr = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(startTime/1000)) if startTime > 0 else '--'
-        self.submitTimeStr = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(submitTime/1000)) if submitTime > 0 else '--'
-        self.finishTimeStr = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(finishTime/1000)) if finishTime > 0 else '--'
-        self.executeSeconds = (finishTime - startTime) / 1000.0
-        self.executeMinutes = self.executeSeconds / 60
+        self.start_time = start_time
+        self.submit_time = submit_time
+        self.finish_time = finish_time
+        self.command_trimmed = command.replace('\n', ' ').replace('\t', '')
+        self.start_time_str = time.strftime('%Y-%m-%d %H:%M:%S',
+                                            time.localtime(start_time / 1000)) if start_time > 0 else '--'
+        self.submit_time_str = time.strftime('%Y-%m-%d %H:%M:%S',
+                                             time.localtime(submit_time / 1000)) if submit_time > 0 else '--'
+        self.finish_time_str = time.strftime('%Y-%m-%d %H:%M:%S',
+                                             time.localtime(finish_time / 1000)) if finish_time > 0 else '--'
+        self.exec_secs = (finish_time - start_time) / 1000.0
+        self.exec_mins = self.exec_secs / 60.0
+
+
+def log_to_file(out_file, mode, event):
+    with open(out_file, mode) as f:
+        f.write(event)
+    return None
+
+
+def log_to_console(event):
+    if DEBUG_MODE:
+        print(event)
+    return None
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print(HELP + " num args = {}".format(len(sys.argv)))
+        print(f"{HELP_MESSAGE}  num args = {len(sys.argv)}")
         sys.exit(1)
-    main(sys.argv)
+    print(f"Extracting Metrics from DBC archive file: {sys.argv[1]}\n")
+    main(sys.argv[1])
     sys.exit(0)
